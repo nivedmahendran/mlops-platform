@@ -1,0 +1,226 @@
+name: stage-3-drift-monitoring
+
+# Stage 3 is only "done" if the monitor can tell a shifted distribution from an
+# unchanged one. A monitor that reports "stable" unconditionally, or that scores
+# a shifted batch as clean, is worse than no monitor: it produces a green signal
+# that a human then trusts.
+#
+# So the assertions are two-sided. The clean batch must NOT trigger drift, and
+# the drifted batch MUST, with the exact set of shifted features identified.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "monitoring/**"
+      - "training/train.py"
+      - ".github/workflows/stage-3-drift-monitoring.yml"
+  pull_request:
+    paths:
+      - "monitoring/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: detect drift / reject clean data
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: training/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r training/requirements.txt
+
+      - name: Start a real MLflow tracking server
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/mlflow/artifacts"
+          python -m mlflow server \
+            --host 127.0.0.1 --port 5001 \
+            --backend-store-uri "sqlite:///$RUNNER_TEMP/mlflow/mlflow.db" \
+            --default-artifact-root "$RUNNER_TEMP/mlflow/artifacts" \
+            --serve-artifacts \
+            > "$RUNNER_TEMP/mlflow/server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5001/health >/dev/null; then
+              echo "tracking server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "tracking server did not become healthy"
+          cat "$RUNNER_TEMP/mlflow/server.log"
+          exit 1
+
+      # The reference profile is produced by training, not by the monitor. If
+      # that export breaks, every drift score downstream is wrong, so it is
+      # fetched from a real run rather than hand-written in the test.
+      - name: Train and fetch the reference profile
+        run: |
+          set -eu
+          python training/train.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --register \
+            --metrics-out "$RUNNER_TEMP/train.json"
+
+          python - <<'PY'
+          import json, mlflow, os, shutil
+          mlflow.set_tracking_uri("http://127.0.0.1:5001")
+          client = mlflow.MlflowClient()
+          versions = client.search_model_versions("name='mlops-platform-model'")
+          latest = max(versions, key=lambda v: int(v.version))
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "ref")
+          shutil.rmtree(dest, ignore_errors=True)
+          path = mlflow.artifacts.download_artifacts(
+              run_id=latest.run_id,
+              artifact_path="reference_profile.json",
+              dst_path=dest,
+          )
+          profile = json.load(open(path))
+          assert profile["n_features"] == 20, profile["n_features"]
+          assert len(profile["features"]) == 20, len(profile["features"])
+          for entry in profile["features"]:
+              assert len(entry["edges"]) == len(entry["proportions"]) + 1, entry["feature"]
+          print("reference profile ok:", profile["n_features"], "features")
+          PY
+
+      - name: Build clean and drifted serving batches
+        run: |
+          set -eu
+          python - <<'PY'
+          import os, sys
+          import numpy as np
+          from sklearn.model_selection import train_test_split
+
+          sys.path.insert(0, "training")
+          from train import generate_data, inject_drift
+
+          features, labels = generate_data(n_samples=5000, n_features=20, seed=42)
+          _, holdout = train_test_split(features, test_size=0.2, random_state=42)
+
+          base = os.environ["RUNNER_TEMP"]
+          np.save(os.path.join(base, "current_clean.npy"), holdout)
+          np.save(os.path.join(base, "current_drifted.npy"), inject_drift(holdout, seed=42))
+          print("clean:", holdout.shape)
+          PY
+
+      # Side one: an unchanged batch must not be reported as drift. Without this
+      # assertion the threshold could be lowered until everything looks drifted.
+      - name: Clean batch is not flagged
+        run: |
+          set -eu
+          python monitoring/detect_drift.py \
+            --reference "$RUNNER_TEMP/ref/reference_profile.json" \
+            --current "$RUNNER_TEMP/current_clean.npy" \
+            --metrics-out "$RUNNER_TEMP/drift_clean.json"
+
+          python - <<'PY'
+          import json, os
+          result = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "drift_clean.json")))
+          assert result["drift_detected"] is False, result
+          assert result["drifted_features"] == [], result["drifted_features"]
+          assert result["max_psi"] < 0.10, f"clean batch scored as shifted: {result['max_psi']}"
+          print(f"clean batch stable: max_psi={result['max_psi']}")
+          PY
+
+      # Side two: the shifted batch must be flagged, and specifically the
+      # features that were shifted. Checking the feature set is what proves the
+      # monitor locates the drift rather than noticing that something moved.
+      - name: Drifted batch is flagged
+        run: |
+          set -eu
+          python monitoring/detect_drift.py \
+            --reference "$RUNNER_TEMP/ref/reference_profile.json" \
+            --current "$RUNNER_TEMP/current_drifted.npy" \
+            --metrics-out "$RUNNER_TEMP/drift_shifted.json" \
+            --prometheus-out "$RUNNER_TEMP/drift.prom"
+
+          python - <<'PY'
+          import json, os
+          base = os.environ["RUNNER_TEMP"]
+          result = json.load(open(os.path.join(base, "drift_shifted.json")))
+          assert result["drift_detected"] is True, result
+          # inject_drift shifts the first half of the columns; those must be the
+          # ones reported, or the monitor is flagging the wrong signal.
+          expected = list(range(10))
+          assert result["drifted_features"] == expected, (
+              f"expected features {expected}, got {result['drifted_features']}"
+          )
+          assert result["max_psi"] >= 0.25, result["max_psi"]
+          print(f"drifted batch flagged: features={result['drifted_features']} max_psi={result['max_psi']}")
+
+          # The Prometheus series must carry the verdict, since that is what the
+          # cluster scrapes and what stage 4 could alert on.
+          prom = open(os.path.join(base, "drift.prom")).read()
+          assert "mlops_drift_detected 1" in prom, prom
+          assert "mlops_drift_psi_max" in prom, prom
+          print("prometheus exposition ok")
+          PY
+
+      - name: Collect inputs from KServe-style logs
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/logs"
+          python - <<'PY'
+          import gzip, json, os
+          import numpy as np
+
+          base = os.path.join(os.environ["RUNNER_TEMP"], "logs")
+          rng = np.random.default_rng(7)
+          for i in range(3):
+              rows = rng.normal(size=(10, 20)).tolist()
+              payload = {"request": {"id": f"req-{i}", "inputs": [
+                  {"name": "predict", "shape": [10, 20], "datatype": "FP64", "data": rows}]}}
+              open(os.path.join(base, f"log-{i}.json"), "w").write(json.dumps(payload))
+          rows = rng.normal(size=(5, 20)).tolist()
+          payload = {"request": {"inputs": [
+              {"name": "predict", "shape": [5, 20], "datatype": "FP64", "data": rows}]}}
+          with gzip.open(os.path.join(base, "log-gz.json.gz"), "wb") as handle:
+              handle.write(json.dumps(payload).encode())
+          PY
+
+          python monitoring/collect_inputs.py \
+            --source "$RUNNER_TEMP/logs" \
+            --window-minutes 0 \
+            --out "$RUNNER_TEMP/collected.npy" \
+            --count-out "$RUNNER_TEMP/collected.count"
+
+          test "$(cat "$RUNNER_TEMP/collected.count")" = "35" || {
+            echo "expected 35 rows collected, got $(cat "$RUNNER_TEMP/collected.count")"; exit 1
+          }
+
+      # An empty window must fail rather than report a clean bill of health.
+      - name: Empty window fails instead of reporting stable
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/no-logs"
+          if python monitoring/collect_inputs.py \
+              --source "$RUNNER_TEMP/no-logs" \
+              --window-minutes 0 \
+              --out "$RUNNER_TEMP/none.npy"; then
+            echo "collect_inputs succeeded on an empty window; it must fail"
+            exit 1
+          fi
+          echo "empty window correctly rejected"
+
+      - name: Upload drift artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-3-drift
+          path: |
+            ${{ runner.temp }}/drift_clean.json
+            ${{ runner.temp }}/drift_shifted.json
+            ${{ runner.temp }}/drift.prom
+            ${{ runner.temp }}/mlflow/server.log
+          if-no-files-found: warn

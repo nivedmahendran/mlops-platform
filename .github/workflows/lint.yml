@@ -43,15 +43,64 @@ jobs:
           curl -sfL -o /tmp/argo-schema.json \
             https://raw.githubusercontent.com/argoproj/argo-workflows/v3.6.5/api/jsonschema/schema.json
 
+      # KServe and Argo Events ship CRDs rather than JSON schemas, so the
+      # openAPIV3Schema is extracted from each CRD and fed to kubeconform in the
+      # same format. Without this the InferenceService, EventSource and Sensor
+      # would all report "Skipped" and never actually be checked.
+      - name: Fetch the KServe and Argo Events CRD schemas
+        run: |
+          set -eu
+          curl -sfL -o /tmp/kserve-crd.yaml \
+            https://raw.githubusercontent.com/kserve/kserve/master/config/crd/full/serving.kserve.io_inferenceservices.yaml
+          curl -sfL -o /tmp/ae-eventsources.yaml \
+            https://raw.githubusercontent.com/argoproj/argo-events/v1.9.3/manifests/base/crds/argoproj.io_eventsources.yaml
+          curl -sfL -o /tmp/ae-sensors.yaml \
+            https://raw.githubusercontent.com/argoproj/argo-events/v1.9.3/manifests/base/crds/argoproj.io_sensors.yaml
+
+          python - <<'PY'
+          import json, yaml
+
+          out = {}
+
+          def add(path):
+              for doc in yaml.safe_load_all(open(path)):
+                  if not doc or doc.get("kind") != "CustomResourceDefinition":
+                      continue
+                  group = doc["spec"]["group"]
+                  kind = doc["spec"]["names"]["kind"]
+                  for version in doc["spec"]["versions"]:
+                      if not version.get("served"):
+                          continue
+                      schema = version.get("schema", {}).get("openAPIV3Schema")
+                      if schema:
+                          out[f"{group}/{version['name']}/{kind}"] = {"schema": schema}
+
+          for path in ["/tmp/kserve-crd.yaml", "/tmp/ae-eventsources.yaml", "/tmp/ae-sensors.yaml"]:
+              add(path)
+
+          json.dump(out, open("/tmp/crd-schema.json", "w"))
+          print("extracted schemas for:", sorted(out))
+          assert out, "no CRD schemas extracted; kubeconform would skip every custom resource"
+          PY
+
       - name: Validate Kubernetes manifests
         run: kubeconform -strict -summary training/mlflow-deployment.yml
 
-      - name: Validate the Argo WorkflowTemplate
+      - name: Validate the Argo WorkflowTemplate and CronWorkflow
         run: |
           kubeconform -strict -summary \
             -schema-location default \
             -schema-location /tmp/argo-schema.json \
-            pipeline/training-workflow.yml
+            pipeline/training-workflow.yml \
+            monitoring/drift-cronworkflow.yml
+
+      - name: Validate the KServe InferenceService and Argo Events
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location /tmp/crd-schema.json \
+            serving/inferenceservice.yml \
+            retraining/event-source.yml
 
   python:
     name: python syntax
@@ -61,4 +110,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m py_compile training/train.py
+      - run: |
+          python -m py_compile \
+            training/train.py \
+            serving/verify_serving.py \
+            serving/promote.py \
+            monitoring/detect_drift.py \
+            monitoring/collect_inputs.py

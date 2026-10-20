@@ -1,0 +1,291 @@
+name: stage-4-automated-retraining
+
+# Stage 4 closes the loop: drift must cause a retrain, and the retrain must
+# still face the quality gate. A cluster is not available in CI, so the
+# assertions target the two ways this stage silently breaks:
+#
+#   1. The monitor never actually posts when drift is real, so no retrain is
+#      ever triggered and the endpoint serves a stale model indefinitely.
+#   2. The sensor submits a workflow whose parameters do not match the
+#      WorkflowTemplate, so the run fails or - worse - trains with defaults and
+#      publishes a model nobody asked for.
+#
+# Both are checked here: the notification is exercised against a real HTTP
+# listener, and the submitted arguments are reconciled against the template's
+# declared parameters.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "retraining/**"
+      - "monitoring/**"
+      - "pipeline/**"
+      - ".github/workflows/stage-4-automated-retraining.yml"
+  pull_request:
+    paths:
+      - "retraining/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retrain:
+    name: drift triggers retrain / parameters match template
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: training/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r training/requirements.txt
+          pip install pyyaml
+
+      - name: Start a real MLflow tracking server
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/mlflow/artifacts"
+          python -m mlflow server \
+            --host 127.0.0.1 --port 5001 \
+            --backend-store-uri "sqlite:///$RUNNER_TEMP/mlflow/mlflow.db" \
+            --default-artifact-root "$RUNNER_TEMP/mlflow/artifacts" \
+            --serve-artifacts \
+            > "$RUNNER_TEMP/mlflow/server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5001/health >/dev/null; then
+              echo "tracking server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "tracking server did not become healthy"
+          cat "$RUNNER_TEMP/mlflow/server.log"
+          exit 1
+
+      - name: Train, then fetch the reference profile
+        run: |
+          set -eu
+          python training/train.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --register \
+            --metrics-out "$RUNNER_TEMP/train.json"
+
+          python - <<'PY'
+          import mlflow, os, shutil
+          mlflow.set_tracking_uri("http://127.0.0.1:5001")
+          versions = mlflow.MlflowClient().search_model_versions("name='mlops-platform-model'")
+          latest = max(versions, key=lambda v: int(v.version))
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "ref")
+          shutil.rmtree(dest, ignore_errors=True)
+          mlflow.artifacts.download_artifacts(
+              run_id=latest.run_id,
+              artifact_path="reference_profile.json",
+              dst_path=dest,
+          )
+          print("reference profile fetched")
+          PY
+
+      - name: Build a drifted batch
+        run: |
+          set -eu
+          python - <<'PY'
+          import os, sys
+          import numpy as np
+          from sklearn.model_selection import train_test_split
+
+          sys.path.insert(0, "training")
+          from train import generate_data, inject_drift
+
+          features, _ = generate_data(n_samples=5000, n_features=20, seed=42)
+          _, holdout = train_test_split(features, test_size=0.2, random_state=42)
+          np.save(os.path.join(os.environ["RUNNER_TEMP"], "current_drifted.npy"),
+                  inject_drift(holdout, seed=42))
+          PY
+
+      # Failure mode 1: the signal never leaves the monitor. A real HTTP
+      # listener stands in for the sensor, so this exercises the actual POST
+      # rather than mocking urllib.
+      - name: Drifted run notifies the sensor endpoint
+        run: |
+          set -eu
+          python - <<'PY' &
+          import json, os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          received = []
+          out = os.path.join(os.environ["RUNNER_TEMP"], "received.json")
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get("Content-Length", 0))
+                  received.append({"path": self.path, "body": json.loads(self.rfile.read(length))})
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b"ok")
+
+              def log_message(self, *args):
+                  pass
+
+          server = HTTPServer(("127.0.0.1", 12000), Handler)
+          for _ in range(1):
+              server.handle_request()
+          with open(out, "w") as handle:
+              json.dump(received, handle)
+          PY
+          listener=$!
+          sleep 2
+
+          python monitoring/detect_drift.py \
+            --reference "$RUNNER_TEMP/ref/reference_profile.json" \
+            --current "$RUNNER_TEMP/current_drifted.npy" \
+            --metrics-out "$RUNNER_TEMP/drift.json" \
+            --notify-url http://127.0.0.1:12000/drift > "$RUNNER_TEMP/notify.log" 2>&1
+
+          wait "$listener"
+
+          python - <<'PY'
+          import json, os
+          base = os.environ["RUNNER_TEMP"]
+          received = json.load(open(os.path.join(base, "received.json")))
+          assert len(received) == 1, f"expected exactly one notification, got {len(received)}"
+          assert received[0]["path"] == "/drift", received[0]["path"]
+          body = received[0]["body"]
+          assert body["drift_detected"] is True, body
+          assert body["max_psi"] >= 0.25, body
+          assert body["drifted_features"] == list(range(10)), body["drifted_features"]
+          print(f"sensor notified with max_psi={body['max_psi']}")
+          PY
+
+      # A clean batch must stay silent, or the sensor would retrain a healthy
+      # model on every scheduled run.
+      - name: Clean run does not notify
+        run: |
+          set -eu
+          python - <<'PY'
+          import os, sys
+          import numpy as np
+          from sklearn.model_selection import train_test_split
+
+          sys.path.insert(0, "training")
+          from train import generate_data
+
+          features, _ = generate_data(n_samples=5000, n_features=20, seed=42)
+          _, holdout = train_test_split(features, test_size=0.2, random_state=42)
+          np.save(os.path.join(os.environ["RUNNER_TEMP"], "current_clean.npy"), holdout)
+          PY
+
+          # Port 12001 has no listener: if the monitor tried to notify, it would
+          # fail and exit non-zero. A clean run must exit 0 without posting.
+          python monitoring/detect_drift.py \
+            --reference "$RUNNER_TEMP/ref/reference_profile.json" \
+            --current "$RUNNER_TEMP/current_clean.npy" \
+            --metrics-out "$RUNNER_TEMP/drift_clean.json" \
+            --notify-url http://127.0.0.1:12001/drift
+
+          python - <<'PY'
+          import json, os
+          result = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "drift_clean.json")))
+          assert result["drift_detected"] is False, result
+          print("clean batch stayed silent")
+          PY
+
+      # Failure mode 2: the sensor submits parameters the template does not
+      # declare. Reconcile the two manifests instead of eyeballing them.
+      - name: Sensor arguments match the WorkflowTemplate
+        run: |
+          set -eu
+          python - <<'PY'
+          import yaml
+
+          with open("pipeline/training-workflow.yml") as handle:
+              template = yaml.safe_load(handle)
+          declared = {
+              p["name"]
+              for p in template["spec"]["arguments"]["parameters"]
+          }
+
+          with open("retraining/event-source.yml") as handle:
+              docs = [d for d in yaml.safe_load_all(handle) if d]
+
+          sensor = next(d for d in docs if d["kind"] == "Sensor")
+          submitted = {}
+          for trigger in sensor["spec"]["triggers"]:
+              source = trigger["template"]["argoWorkflow"]["source"]["resource"]
+              ref = source["spec"]["workflowTemplateRef"]["name"]
+              assert ref == template["metadata"]["name"], (
+                  f"sensor submits {ref!r} but the template is "
+                  f"{template['metadata']['name']!r}"
+              )
+              for param in source["spec"]["arguments"]["parameters"]:
+                  submitted[param["name"]] = param["value"]
+
+          unknown = set(submitted) - declared
+          assert not unknown, f"sensor passes parameters the template does not declare: {unknown}"
+
+          for name, value in submitted.items():
+              assert value is not None and value != "", f"parameter {name!r} has an empty value"
+          assert submitted.get("drift-inject") == "false", submitted
+
+          print(f"sensor arguments ok, reconciled against {sorted(declared)}")
+          PY
+
+      # The event chain must be wired: the monitor posts to the EventSource
+      # service, and the Sensor consumes from it.
+      - name: Notification target matches the EventSource
+        run: |
+          set -eu
+          python - <<'PY'
+          import re, yaml
+
+          with open("retraining/event-source.yml") as handle:
+              docs = [d for d in yaml.safe_load_all(handle) if d]
+
+          event_source = next(d for d in docs if d["kind"] == "EventSource")
+          service = next(d for d in docs if d["kind"] == "Service")
+          sensor = next(d for d in docs if d["kind"] == "Sensor")
+
+          webhook = event_source["spec"]["webhook"]["drift-detected"]
+          port = webhook["port"]
+          endpoint = webhook["endpoint"]
+          assert any(str(p["port"]) == str(port) for p in service["spec"]["ports"]), service["spec"]["ports"]
+
+          with open("monitoring/drift-cronworkflow.yml") as handle:
+              cron = yaml.safe_load(handle)
+          env = cron["spec"]["workflowSpec"]["templates"]
+          notify = None
+          for template in env:
+              container = template.get("container") or {}
+              for entry in container.get("env") or []:
+                  if entry["name"] == "DRIFT_NOTIFY_URL":
+                      notify = entry["value"]
+          assert notify, "drift CronWorkflow does not set DRIFT_NOTIFY_URL"
+          assert notify.endswith(endpoint), f"{notify} does not end with {endpoint!r}"
+          assert f":{port}/" in notify, f"{notify} does not target port {port}"
+
+          dependency = sensor["spec"]["dependencies"][0]
+          assert dependency["eventSourceName"] == event_source["metadata"]["name"], dependency
+          assert dependency["eventName"] == "drift-detected", dependency
+          print(f"event chain ok: {notify}")
+          PY
+
+      - name: Upload stage 4 artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-4-retraining
+          path: |
+            ${{ runner.temp }}/received.json
+            ${{ runner.temp }}/notify.log
+            ${{ runner.temp }}/drift.json
+            ${{ runner.temp }}/drift_clean.json
+            ${{ runner.temp }}/mlflow/server.log
+          if-no-files-found: warn

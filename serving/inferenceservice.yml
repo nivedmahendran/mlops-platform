@@ -1,0 +1,71 @@
+# KServe InferenceService: serve the model the registry says is current.
+#
+# Stage 1 ends with a version in the MLflow registry. This manifest is the
+# contract that turns that artifact into an endpoint.
+#
+# Why modelFormat mlflow + protocolVersion v2:
+#   * KServe's MLflow runtime (MLServer) is the runtime that understands the
+#     MLflow model directory layout written by `mlflow.sklearn.log_model`. The
+#     plain `sklearn` runtime expects a bare pickled estimator and does not read
+#     the MLmodel file, so it would ignore the recorded signature.
+#   * protocolVersion v2 pins the Open Inference Protocol, which is the payload
+#     shape `serving/verify_serving.py` exercises. Asserting the same shape in CI
+#     is what makes this manifest more than a guess.
+#
+# Why storageUri points at MinIO and not at `models:/...`:
+#   * The storage initializer is an init container that materialises a directory;
+#     it has no MLflow client and cannot resolve a registry URI. The registry is
+#     therefore resolved by `serving/promote.py`, which copies the current
+#     version's artifact tree into the bucket this manifest reads from. The
+#     indirection is deliberate: the serving path never talks to the registry.
+
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: mlops-platform
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+  annotations:
+    # Recorded so the running endpoint can be traced back to the registry
+    # version it was built from. `promote.py` rewrites this on each promotion.
+    mlops.platform/model-version: "1"
+    # Scale to zero: an idle demo endpoint should not hold a node awake. KServe
+    # keeps the first request after scale-down slow rather than never scaling.
+    autoscaling.knative.dev/minScale: "0"
+    autoscaling.knative.dev/maxScale: "3"
+spec:
+  predictor:
+    minReplicas: 0
+    model:
+      modelFormat:
+        name: mlflow
+      protocolVersion: v2
+      storageUri: s3://mlflow/models/mlops-platform-model
+      # The storage initializer needs credentials to read the bucket. In a real
+      # cluster this is an IRSA/Workload-Identity binding; here it is a secret
+      # so the manifest runs against the MinIO from stage 1 unchanged.
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: secret-key
+        - name: S3_ENDPOINT
+          value: http://minio.mlops.svc.cluster.local:9000
+        - name: S3_USE_HTTPS
+          value: "0"
+        - name: AWS_REGION
+          value: us-east-1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi

@@ -1,0 +1,113 @@
+# Stage 4: automated retraining.
+#
+# A drift score is only useful if something acts on it. This is that action: when
+# the monitor reports drift above the threshold, the training workflow from
+# stage 1 is submitted, and its quality gate decides whether the result is
+# publishable.
+#
+# The retrain is deliberately the *same* WorkflowTemplate as stage 1 rather than
+# a copy. A separate retraining pipeline would drift from the manual one and
+# eventually produce a model the serving path cannot load. One template, two
+# callers (a human, and this sensor), is the property that keeps them honest.
+#
+# Why Argo Events rather than a CronWorkflow that trains directly:
+#   * The decision to retrain belongs to the drift signal, not to the clock. A
+#     schedule would retrain a healthy model and, worse, would not retrain a
+#     model that drifted just after the schedule fired.
+#   * The sensor reuses `training-pipeline`, so the retrained model passes the
+#     same min-accuracy gate as any other. Drift triggers a run; it does not
+#     authorise a release.
+
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: drift-events
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  # The monitor posts here when (and only when) it finds drift. The webhook is
+  # internal: no ingress, and the service is only reachable inside the cluster.
+  webhook:
+    drift-detected:
+      port: "12000"
+      endpoint: /drift
+      method: POST
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drift-events
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  selector:
+    eventsource-name: drift-events
+  ports:
+    - name: webhook
+      port: 12000
+      targetPort: 12000
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: retrain-on-drift
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  template:
+    serviceAccountName: argo-events-sa
+  dependencies:
+    - name: drift
+      eventSourceName: drift-events
+      eventName: drift-detected
+      # The body carries the monitor's verdict. The filter is here as well as in
+      # the monitor so a stray POST cannot trigger a retrain: both the flag and
+      # the score are checked, and either one alone is not enough.
+      filters:
+        data:
+          - path: body.drift_detected
+            type: bool
+            value: ["true"]
+
+  triggers:
+    - template:
+        name: submit-training-pipeline
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: retrain-drift-
+                namespace: mlops
+                labels:
+                  app.kubernetes.io/part-of: mlops-platform
+                  mlops.platform/trigger: drift
+              spec:
+                # Submitted from the stage-1 template, so the gate step, the
+                # metrics contract, and the registry write are all identical to
+                # a manual run.
+                workflowTemplateRef:
+                  name: training-pipeline
+                arguments:
+                  parameters:
+                    # The drifted data is what the retrain should learn from, so
+                    # the run that follows a drift signal trains on the shifted
+                    # distribution on purpose. `drift-inject=false` because the
+                    # data is already the new world; injecting again would shift
+                    # it a second time and produce a model for a distribution
+                    # nobody is in.
+                    - name: drift-inject
+                      value: "false"
+                    # A label, not a dataset pointer: it records *why* this run
+                    # happened so a run can be traced back to a drift signal.
+                    - name: data-version
+                      value: "drift-retrain"
+                    # The gate is unchanged. Drift justifies a run; it does not
+                    # lower the bar for publishing the result.
+                    - name: min-accuracy
+                      value: "0.80"

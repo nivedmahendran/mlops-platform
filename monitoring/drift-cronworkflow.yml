@@ -1,0 +1,130 @@
+# Scheduled drift monitor.
+#
+# A CronWorkflow rather than a long-running service: drift is evaluated on a
+# cadence, and a job that runs and exits leaves a metric series behind without
+# anything staying resident. Nothing needs to be up between runs.
+#
+# The batch of serving inputs is materialised from the KServe request logger.
+# KServe writes each request/response pair to the bucket configured on the
+# InferenceService; this workflow pulls the recent window, converts it to the
+# feature array the monitor expects, and scores it against the reference profile
+# exported at training time.
+
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: drift-monitor
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  workflowSpec:
+    entrypoint: monitor
+
+    arguments:
+      parameters:
+        - name: window-minutes
+          value: "15"
+        # Stage 4 acts on this. Kept as a parameter so the sensitivity can be
+        # raised during a migration or lowered while a new feature ships,
+        # without editing the workflow.
+        - name: psi-threshold
+          value: "0.25"
+
+    templates:
+      - name: monitor
+        dag:
+          tasks:
+            - name: fetch-inputs
+              template: fetch-inputs
+            - name: score-drift
+              template: score-drift
+              depends: fetch-inputs
+
+      - name: fetch-inputs
+        outputs:
+          parameters:
+            - name: sample-count
+              valueFrom:
+                path: /tmp/inputs/count
+        container:
+          image: ghcr.io/nivedmahendran/mlops-platform-training:0.1.0
+          env:
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: http://minio.mlops.svc.cluster.local:9000
+          command: ["python", "collect_inputs.py"]
+          args:
+            - "--window-minutes={{workflow.parameters.window-minutes}}"
+            - "--out=/tmp/inputs/current.npy"
+            - "--source=s3://mlflow/kserve-logs"
+          volumeMounts:
+            - name: work
+              mountPath: /tmp/inputs
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      - name: score-drift
+        inputs:
+          parameters:
+            - name: psi-threshold
+              value: "{{workflow.parameters.psi-threshold}}"
+        outputs:
+          # Stage 4's sensor watches for this file rather than re-deriving the
+          # verdict, so there is exactly one place the decision is made.
+          parameters:
+            - name: drift
+              valueFrom:
+                path: /tmp/inputs/drift.json
+        container:
+          image: ghcr.io/nivedmahendran/mlops-platform-training:0.1.0
+          command: ["python", "detect_drift.py"]
+          args:
+            - "--reference=/tmp/inputs/reference_profile.json"
+            - "--current=/tmp/inputs/current.npy"
+            - "--threshold={{inputs.parameters.psi-threshold}}"
+            - "--metrics-out=/tmp/inputs/drift.json"
+            - "--prometheus-out=/tmp/inputs/drift.prom"
+          env:
+            # Stage 4's sensor. Set here rather than baked into the image so the
+            # monitor still runs when the retraining path is not installed.
+            - name: DRIFT_NOTIFY_URL
+              value: http://drift-events.mlops.svc.cluster.local:12000/drift
+          volumeMounts:
+            - name: work
+              mountPath: /tmp/inputs
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+    volumes:
+      - name: work
+        emptyDir: {}

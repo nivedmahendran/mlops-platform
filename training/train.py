@@ -119,6 +119,62 @@ def build_model(max_iter: int, c_value: float, seed: int) -> Pipeline:
     )
 
 
+def reference_profile(features: np.ndarray, n_bins: int = 10) -> dict[str, Any]:
+    """Summarise the training distribution for drift detection.
+
+    Stored per feature, and that is not an implementation detail. A joint
+    histogram over all features would need `n_bins ** n_features` cells: with 20
+    features and 10 bins that is 1e20 bins, which numpy rejects outright and
+    which would be too sparse to estimate from any real sample count even if it
+    did not. Drift is therefore measured one feature at a time, and the profile
+    is a list with one entry per feature.
+
+    Stores per-feature decile edges plus the resulting bin proportions. The
+    edges matter more than the proportions: the monitor must bin serving data
+    with the *training* edges, otherwise it re-derives bins from the new data
+    and a shift that moves every value by the same amount scores as no drift at
+    all. That failure mode is invisible unless the edges are carried across.
+
+    Quantile edges are used rather than equal-width ones because the synthetic
+    features are roughly normal, and equal-width bins put almost every sample in
+    the middle bin, where a shift barely moves the proportions. Deciles give
+    each bin a meaningful share of the reference mass.
+    """
+    quantiles = np.linspace(0, 100, n_bins + 1)
+    per_feature = []
+    for j in range(features.shape[1]):
+        column = features[:, j]
+        edges = np.percentile(column, quantiles)
+
+        # Guard against duplicated edges on constant or near-constant features,
+        # which would make the bin index ambiguous. Widening by a small epsilon
+        # keeps every feature binnable.
+        for i in range(1, edges.shape[0]):
+            if edges[i] <= edges[i - 1]:
+                edges[i] = edges[i - 1] + 1e-9
+
+        counts, _ = np.histogram(column, bins=edges)
+        total = counts.sum()
+        proportions = (counts / total).tolist() if total else []
+
+        per_feature.append(
+            {
+                "feature": j,
+                "edges": edges.tolist(),
+                "proportions": proportions,
+                "mean": float(column.mean()),
+                "std": float(column.std()),
+            }
+        )
+
+    return {
+        "n_features": int(features.shape[1]),
+        "n_samples": int(features.shape[0]),
+        "n_bins": int(n_bins),
+        "features": per_feature,
+    }
+
+
 def evaluate(model: Pipeline, features: np.ndarray, labels: np.ndarray) -> dict[str, float]:
     """Compute the metrics the platform reports.
 
@@ -227,6 +283,15 @@ def main() -> int:
 
             model = build_model(args.max_iter, args.c_value, args.seed)
             model.fit(x_train, y_train)
+
+            # Stage 3's monitor needs the training distribution to compare
+            # serving inputs against. Exporting it here, from the same x_train
+            # the model was fitted on, is what keeps the reference honest: a
+            # profile computed from the full dataset or re-generated later with
+            # different parameters would describe a distribution the model never
+            # saw, and every drift score would be wrong.
+            reference = reference_profile(x_train)
+            mlflow.log_dict(reference, "reference_profile.json")
 
             train_metrics = evaluate(model, x_train, y_train)
             # Scored against the (possibly drifted) holdout. This is the number

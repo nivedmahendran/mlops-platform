@@ -1,0 +1,136 @@
+name: stage-2-serving
+
+# Stage 2 is only "done" if a registered model can actually be turned into an
+# endpoint. A cluster is not available in CI, so the assertions target the two
+# things that make the InferenceService work: the artifact tree the storage
+# initializer will read, and the Open Inference Protocol payload the runtime
+# will answer. If either is wrong, the pod starts and never becomes ready.
+#
+# The InferenceService manifest itself is validated by the `manifests` job in
+# lint.yml, which fetches the KServe CRD schema.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "serving/**"
+      - "training/train.py"
+      - ".github/workflows/stage-2-serving.yml"
+  pull_request:
+    paths:
+      - "serving/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  serve:
+    name: promote / verify serving contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: training/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r training/requirements.txt
+
+      - name: Start a real MLflow tracking server
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/mlflow/artifacts"
+          python -m mlflow server \
+            --host 127.0.0.1 --port 5001 \
+            --backend-store-uri "sqlite:///$RUNNER_TEMP/mlflow/mlflow.db" \
+            --default-artifact-root "$RUNNER_TEMP/mlflow/artifacts" \
+            --serve-artifacts \
+            > "$RUNNER_TEMP/mlflow/server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5001/health >/dev/null; then
+              echo "tracking server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "tracking server did not become healthy"
+          cat "$RUNNER_TEMP/mlflow/server.log"
+          exit 1
+
+      # Stage 2 serves what stage 1 produced, so it produces one here rather
+      # than depending on a previous job's state.
+      - name: Train and register a model
+        run: |
+          set -eu
+          python training/train.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --register \
+            --metrics-out "$RUNNER_TEMP/train.json"
+
+      # Promotion is what fills the bucket the InferenceService reads. Asserting
+      # on the resulting file list is what proves the storage initializer will
+      # find a loadable model rather than an empty prefix.
+      - name: Promote the version into serving storage
+        run: |
+          set -eu
+          python serving/promote.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --destination "$RUNNER_TEMP/serving-store" \
+            | tee "$RUNNER_TEMP/promote.log"
+
+          model_dir="$RUNNER_TEMP/serving-store/mlops-platform-model"
+          test -f "$model_dir/MLmodel" || {
+            echo "no MLmodel at the promoted destination"; ls -R "$model_dir"; exit 1
+          }
+
+      # The artifact directory must survive a fresh process, because that is
+      # exactly how KServe loads it: a different container, no Python state.
+      - name: Promoted model loads in a clean process
+        run: |
+          set -eu
+          python - <<'PY'
+          import os, mlflow, numpy as np
+          model_dir = os.path.join(os.environ["RUNNER_TEMP"], "serving-store", "mlops-platform-model")
+          model = mlflow.sklearn.load_model(model_dir)
+          out = model.predict(np.zeros((3, 20)))
+          assert len(out) == 3, out
+          print("promoted model loaded and served 3 predictions:", out.tolist())
+          PY
+
+      # And the Open Inference Protocol contract must hold, since that is the
+      # payload shape the manifest declares and clients will send.
+      - name: Verify the v2 inference protocol contract
+        run: |
+          set -eu
+          python serving/verify_serving.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            | tee "$RUNNER_TEMP/verify.log"
+
+          python - <<'PY'
+          import json, os, re
+          log = open(os.path.join(os.environ["RUNNER_TEMP"], "verify.log")).read()
+          # verify_serving.py prints a JSON document last; take the trailing object.
+          match = re.search(r"\{.*\}\s*$", log, re.S)
+          assert match, f"no JSON result in verify output:\n{log}"
+          result = json.loads(match.group(0))
+          assert result["servable"] is True, result
+          assert result["n_features"] == 20, result
+          print(f"serving contract ok: version={result['model_version']} features={result['n_features']}")
+          PY
+
+      - name: Upload serving artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-2-serving
+          path: |
+            ${{ runner.temp }}/promote.log
+            ${{ runner.temp }}/verify.log
+            ${{ runner.temp }}/mlflow/server.log
+          if-no-files-found: warn
