@@ -1,0 +1,125 @@
+name: stage-1-training
+
+# Stage 1 is only "done" if the pipeline runs, logs, and registers against a
+# real tracking server. This job starts an MLflow server in the runner and
+# exercises both paths: a clean run that must pass the quality gate, and a
+# drifted run that must produce a measurable drop. Asserting on both is what
+# stops the drift signal silently regressing to zero (which is exactly how the
+# first version of train.py behaved).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "training/**"
+      - "pipeline/**"
+      - ".github/workflows/stage-1-training.yml"
+  pull_request:
+    paths:
+      - "training/**"
+      - "pipeline/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: train / log / register
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: training/requirements.txt
+
+      - name: Install training dependencies
+        run: pip install -r training/requirements.txt
+
+      - name: Start a real MLflow tracking server
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/mlflow/artifacts"
+          python -m mlflow server \
+            --host 127.0.0.1 --port 5001 \
+            --backend-store-uri "sqlite:///$RUNNER_TEMP/mlflow/mlflow.db" \
+            --default-artifact-root "$RUNNER_TEMP/mlflow/artifacts" \
+            --serve-artifacts \
+            > "$RUNNER_TEMP/mlflow/server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5001/health >/dev/null; then
+              echo "tracking server is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "tracking server did not become healthy"
+          cat "$RUNNER_TEMP/mlflow/server.log"
+          exit 1
+
+      # A clean run must register a model version. If this fails, stage 2 has
+      # nothing to serve.
+      - name: Clean run (must pass the gate)
+        run: |
+          set -eu
+          python training/train.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --register \
+            --metrics-out clean.json
+          python - <<'PY'
+          import json, sys
+          m = json.load(open("clean.json"))
+          acc = m["test_metrics"]["accuracy"]
+          assert m["model_version"] >= 1, m
+          assert m["drift_accuracy_drop"] == 0.0, f"clean run should show no drop: {m['drift_accuracy_drop']}"
+          assert acc >= 0.80, f"clean accuracy {acc} below the gate"
+          print(f"clean run ok: version={m['model_version']} accuracy={acc:.4f}")
+          PY
+
+      # The drifted run must show a real drop. Without this assertion the flag
+      # could stop shifting anything and the workflow would still be green.
+      - name: Drifted run (must show a measurable drop)
+        run: |
+          set -eu
+          python training/train.py \
+            --tracking-uri http://127.0.0.1:5001 \
+            --drift-inject \
+            --metrics-out drift.json
+          python - <<'PY'
+          import json
+          m = json.load(open("drift.json"))
+          drop = m["drift_accuracy_drop"]
+          assert drop >= 0.05, f"drift-inject produced no usable signal: drop={drop}"
+          print(f"drift run ok: drop={drop:.4f}")
+          PY
+
+      # The registered model must be loadable, because that is precisely what
+      # stage 2 does. Checking it here catches a broken registry entry before
+      # the serving stage exists.
+      - name: Registered model loads and predicts
+        run: |
+          set -eu
+          python - <<'PY'
+          import mlflow, numpy as np
+          mlflow.set_tracking_uri("http://127.0.0.1:5001")
+          model = mlflow.sklearn.load_model("models:/mlops-platform-model/latest")
+          out = model.predict(np.zeros((3, 20)))
+          assert len(out) == 3, out
+          print("registered model served 3 predictions:", out.tolist())
+          PY
+
+      - name: Upload run artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-1-metrics
+          path: |
+            clean.json
+            drift.json
+            ${{ runner.temp }}/mlflow/server.log
+          if-no-files-found: warn

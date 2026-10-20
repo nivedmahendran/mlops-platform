@@ -1,0 +1,146 @@
+# Argo Workflow: the training pipeline.
+#
+# This is the orchestration layer. The same workflow is what stage 4 triggers
+# automatically when drift is detected, so it is written to be run by a machine:
+# every input is a parameter, and it fails loudly rather than publishing a bad
+# model.
+#
+# Why a Workflow and not a CronJob:
+#   * The steps have real dependencies (train -> evaluate -> gate -> register),
+#     and expressing that in a Deployment spec means encoding the DAG in shell.
+#   * A failed run keeps its pod logs and artefacts for inspection; a failed
+#     CronJob history is truncated by default.
+#   * Stage 4 needs to trigger a run programmatically with parameters, which is
+#     a Workflow submission, not a pod spec edit.
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: training-pipeline
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  entrypoint: pipeline
+
+  # Fail the whole workflow as soon as any step fails, rather than running the
+  # remaining steps against a model that was never produced.
+  podGC:
+    strategy: OnPodCompletion
+
+  arguments:
+    parameters:
+      - name: data-version
+        value: "v1"
+      - name: n-samples
+        value: "5000"
+      - name: seed
+        value: "42"
+      - name: drift-inject
+        value: "false"
+      # A release is gated on this. Automated retraining (stage 4) should not
+      # publish a model that scores worse than the one already serving.
+      - name: min-accuracy
+        value: "0.80"
+
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          - name: train
+            template: train
+            arguments:
+              parameters:
+                - name: data-version
+                  value: "{{workflow.parameters.data-version}}"
+                - name: drift-inject
+                  value: "{{workflow.parameters.drift-inject}}"
+
+          - name: gate
+            template: quality-gate
+            depends: train
+            arguments:
+              parameters:
+                - name: metrics
+                  value: "{{tasks.train.outputs.parameters.metrics}}"
+                - name: min-accuracy
+                  value: "{{workflow.parameters.min-accuracy}}"
+
+    - name: train
+      inputs:
+        parameters:
+          - name: data-version
+          - name: drift-inject
+      outputs:
+        # Passed to the gate step and, in stage 4, read back to decide whether
+        # the retrained model replaces the serving one.
+        parameters:
+          - name: metrics
+            valueFrom:
+              path: /tmp/metrics.json
+      container:
+        image: ghcr.io/nivedmahendran/mlops-platform-training:0.1.0
+        # The container is given only what the run needs; the tracking URI and
+        # model name are configuration, not baked into the image.
+        env:
+          - name: MLFLOW_TRACKING_URI
+            value: http://mlflow.mlops.svc.cluster.local:5000
+          - name: MLFLOW_S3_ENDPOINT_URL
+            value: http://minio.mlops.svc.cluster.local:9000
+        command: ["python", "train.py"]
+        args:
+          - "--data-version={{inputs.parameters.data-version}}"
+          - "--drift-inject={{inputs.parameters.drift-inject}}"
+          - "--n-samples={{workflow.parameters.n-samples}}"
+          - "--seed={{workflow.parameters.seed}}"
+          - "--register"
+          - "--metrics-out=/tmp/metrics.json"
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+    - name: quality-gate
+      inputs:
+        parameters:
+          - name: metrics
+          - name: min-accuracy
+      container:
+        image: python:3.12-slim
+        command: ["python", "-c"]
+        args:
+          - |
+                    import json, sys
+
+                    raw = """{{inputs.parameters.metrics}}"""
+                    min_accuracy = float("""{{inputs.parameters.min-accuracy}}""")
+
+                    try:
+                        metrics = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        print(f"metrics payload was not valid JSON: {exc}")
+                        print(f"raw value: {raw!r}")
+                        sys.exit(1)
+
+                    accuracy = metrics["test_metrics"]["accuracy"]
+                    print(f"test accuracy: {accuracy:.4f}")
+                    print(f"required:      {min_accuracy:.4f}")
+
+                    if accuracy < min_accuracy:
+                        # Failing here is the point of the gate: a model below
+                        # the bar must not be promoted just because the pipeline
+                        # ran to completion.
+                        print("FAILED: accuracy below threshold; not promoting")
+                        sys.exit(1)
+
+                    print("PASSED: accuracy meets threshold")

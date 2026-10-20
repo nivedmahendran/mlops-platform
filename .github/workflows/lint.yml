@@ -1,0 +1,64 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install yamllint
+      - run: yamllint .
+
+  manifests:
+    name: kubeconform + argo schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          set -eu
+          curl -sfL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+
+      # Argo CRDs are not in kubeconform's default schema set, so the published
+      # Argo schema is fetched and used explicitly. Without it the workflow would
+      # be silently skipped rather than validated.
+      - name: Fetch the Argo Workflows JSON schema
+        run: |
+          curl -sfL -o /tmp/argo-schema.json \
+            https://raw.githubusercontent.com/argoproj/argo-workflows/v3.6.5/api/jsonschema/schema.json
+
+      - name: Validate Kubernetes manifests
+        run: kubeconform -strict -summary training/mlflow-deployment.yml
+
+      - name: Validate the Argo WorkflowTemplate
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location /tmp/argo-schema.json \
+            pipeline/training-workflow.yml
+
+  python:
+    name: python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile training/train.py

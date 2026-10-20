@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+mlflow.db
+mlruns/
+mlartifacts/
+artifacts/
+clean.json
+drift.json
+*.egg-info/

@@ -1,0 +1,360 @@
+# The tracking server and its artefact store.
+#
+# MLflow needs two things to be useful: a backend store for run metadata and an
+# artefact store for model files. Using SQLite and a local directory works on a
+# laptop and fails on Kubernetes, because a pod that restarts loses both. So the
+# backend is Postgres and the artefact store is MinIO (S3-compatible), which is
+# what the platform is actually deployed against.
+#
+# These are deliberately plain Deployments and not an operator: the point of
+# this project is the pipeline, and hand-writing these makes the storage
+# contract explicit rather than hidden behind a CRD.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mlflow-db
+  namespace: mlops
+type: Opaque
+stringData:
+  # A real deployment sources this from a secret manager. It is inline here so
+  # the manifests are self-contained and can be applied to a test cluster.
+  POSTGRES_USER: mlflow
+  POSTGRES_PASSWORD: mlflow
+  POSTGRES_DB: mlflow
+  # MLflow's SQLAlchemy URL. The driver is psycopg2, pulled in by the official
+  # image's psycopg2 variant below.
+  MLFLOW_BACKEND_STORE_URI: postgresql://mlflow:mlflow@postgres.mlops.svc.cluster.local:5432/mlflow
+  MLFLOW_S3_ENDPOINT_URL: http://minio.mlops.svc.cluster.local:9000
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: mlops
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+    app.kubernetes.io/component: mlflow-backend
+spec:
+  replicas: 1
+  strategy:
+    # The PVC is ReadWriteOnce, so a rolling update would try to attach it to
+    # two pods at once and stall. Recreate is the correct strategy here.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: docker.io/postgres:16.4-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: mlflow-db
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mlflow"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mlflow"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: mlops
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: mlops
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+    app.kubernetes.io/component: artifact-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: minio
+          image: docker.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-db
+                  key: AWS_ACCESS_KEY_ID
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-db
+                  key: AWS_SECRET_ACCESS_KEY
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: mlops
+spec:
+  selector:
+    app.kubernetes.io/name: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio-create-bucket
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: mc
+          image: docker.io/minio/mc:RELEASE.2024-10-08T09-37-26Z
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-db
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mlflow-db
+                  key: AWS_SECRET_ACCESS_KEY
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # mc configures itself from the env vars above; no stored config is
+              # written, which matters because the filesystem is not writable.
+              until mc alias set local http://minio.mlops.svc.cluster.local:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; do
+                echo "waiting for minio..."
+                sleep 3
+              done
+              # Same bucket the training job uploads artefacts to. Creating it
+              # here rather than in the job keeps the job free of S3 setup code.
+              mc mb --ignore-existing local/mlflow
+              mc anonymous set none local/mlflow
+              echo "bucket ready"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+    app.kubernetes.io/component: tracking-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mlflow
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mlflow
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: mlflow
+          # Version must match training/requirements.txt: the client and server
+          # disagree across the 2.x/3.x boundary, and the model registry layout
+          # changed between them.
+          # The `-full` tag ships the Postgres driver and S3 client that the
+          # server needs to talk to the backend and artefact store.
+          image: docker.io/ghcr.io/mlflow/mlflow:v3.17.1
+          command: ["mlflow", "server"]
+          args:
+            - "--host=0.0.0.0"
+            - "--port=5000"
+            - "--backend-store-uri=$(MLFLOW_BACKEND_STORE_URI)"
+            - "--default-artifact-root=s3://mlflow/"
+            - "--serve-artifacts"
+          ports:
+            - name: http
+              containerPort: 5000
+          envFrom:
+            - secretRef:
+                name: mlflow-db
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  selector:
+    app.kubernetes.io/name: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http

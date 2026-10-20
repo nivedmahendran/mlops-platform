@@ -1,0 +1,9 @@
+# Pinned to the versions this pipeline was actually executed and verified
+# against. MLflow 2.x and 3.x differ in ways that matter here (the logging API
+# for models changed from `artifact_path` to `name`, and the registry artifact
+# layout changed), so the pin is not cosmetic - bumping it requires re-running
+# the pipeline and the stage 2 serving check.
+mlflow==3.17.1
+scikit-learn==1.9.1
+numpy==2.5.4
+boto3==1.35.36
